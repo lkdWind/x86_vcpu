@@ -6,13 +6,13 @@
 use bit_field::BitField;
 use x86::bits64::vmx;
 
-use axaddrspace::{GuestPhysAddr, HostPhysAddr};
+use axaddrspace::{GuestPhysAddr, HostPhysAddr, NestedPageFaultInfo};
 use axerrno::{ax_err, AxResult};
 use page_table_entry::MappingFlags;
 
 use super::as_axerr;
 use super::definitions::{VmxExitReason, VmxInstructionError, VmxInterruptionType};
-use crate::{arch::msr::Msr, NestedPageFaultInfo};
+use crate::msr::Msr;
 
 // HYGIENE: These macros are only used in this file, so we can use `as_axerr` directly.
 

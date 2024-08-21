@@ -9,10 +9,10 @@ use x86::dtables::{self, DescriptorTablePointer};
 use x86::segmentation::SegmentSelector;
 use x86_64::registers::control::{Cr0, Cr0Flags, Cr3, Cr4, Cr4Flags, EferFlags};
 
-use axaddrspace::{GuestPhysAddr, GuestVirtAddr, HostPhysAddr};
+use axaddrspace::{GuestPhysAddr, GuestVirtAddr, HostPhysAddr, NestedPageFaultInfo};
 use axerrno::{ax_err, ax_err_type, AxResult};
 use axvcpu::{AxArchVCpu, AxVCpuExitReason};
-// Todo: remove this.
+
 use super::as_axerr;
 use super::definitions::VmxExitReason;
 use super::structs::{IOBitmap, MsrBitmap, VmxRegion};
@@ -21,11 +21,9 @@ use super::vmcs::{
     VmcsGuestNW, VmcsHost16, VmcsHost32, VmcsHost64, VmcsHostNW,
 };
 use super::VmxExitInfo;
-use crate::arch::{ept::GuestPageWalkInfo, msr::Msr, regs::GeneralRegisters};
-use crate::{AxVMHal, NestedPageFaultInfo};
-use axvcpu::get_current_vcpu;
+use crate::{ept::GuestPageWalkInfo, msr::Msr, regs::GeneralRegisters};
 
-static mut VMX_PREEMPTION_TIMER_SET_VALUE: u32 = 1000_000;
+const VMX_PREEMPTION_TIMER_SET_VALUE: u32 = 1000_000;
 
 pub struct XState {
     host_xcr0: u64,
@@ -66,15 +64,15 @@ const CR0_PE: usize = 1 << 0;
 
 /// A virtual CPU within a guest.
 #[repr(C)]
-pub struct VmxVcpu<H: AxVMHal> {
+pub struct VmxVcpu {
     // DO NOT modify `guest_regs` and `host_stack_top` and their order unless you do know what you are doing!
     // DO NOT add anything before or between them unless you do know what you are doing!
     guest_regs: GeneralRegisters,
     host_stack_top: u64,
     launched: bool,
-    vmcs: VmxRegion<H>,
-    io_bitmap: IOBitmap<H>,
-    msr_bitmap: MsrBitmap<H>,
+    vmcs: VmxRegion,
+    io_bitmap: IOBitmap,
+    msr_bitmap: MsrBitmap,
     pending_events: VecDeque<(u8, Option<u32>)>,
     xstate: XState,
     entry: Option<GuestPhysAddr>,
@@ -82,7 +80,7 @@ pub struct VmxVcpu<H: AxVMHal> {
     // is_host: bool, temporary removed because we don't care about type 1.5 now
 }
 
-impl<H: AxVMHal> VmxVcpu<H> {
+impl VmxVcpu {
     /// Create a new [`VmxVcpu`].
     pub fn new() -> AxResult<Self> {
         let vmcs_revision_id = super::read_vmcs_revision_id();
@@ -100,10 +98,6 @@ impl<H: AxVMHal> VmxVcpu<H> {
             ept_root: None,
             // is_host: false,
         };
-        // Todo: remove these functions.
-        // vcpu.setup_io_bitmap()?;
-        // vcpu.setup_msr_bitmap()?;
-        // vcpu.setup_vmcs(entry, ept_root)?;
         info!("[HV] created VmxVcpu(vmcs: {:#x})", vcpu.vmcs.phys_addr());
         Ok(vcpu)
     }
@@ -114,16 +108,15 @@ impl<H: AxVMHal> VmxVcpu<H> {
         Ok(())
     }
 
-    /// Get the identifier of this [`VmxVcpu`].
-    pub fn vcpu_id(&self) -> usize {
-        get_current_vcpu::<Self>().unwrap().id()
-    }
+    // /// Get the identifier of this [`VmxVcpu`].
+    // pub fn vcpu_id(&self) -> usize {
+    //     get_current_vcpu::<Self>().unwrap().id()
+    // }
 
     /// Bind this [`VmxVcpu`] to current logical processor.
     pub fn bind_to_current_processor(&self) -> AxResult {
         debug!(
-            "VmxVcpu[{}] bind to current processor vmcs @ {:#x}",
-            self.vcpu_id(),
+            "VmxVcpu bind to current processor vmcs @ {:#x}",
             self.vmcs.phys_addr()
         );
         unsafe {
@@ -135,8 +128,7 @@ impl<H: AxVMHal> VmxVcpu<H> {
     /// Unbind this [`VmxVcpu`] from current logical processor.
     pub fn unbind_from_current_processor(&self) -> AxResult {
         debug!(
-            "VmxVcpu[{}] unbind from current processor vmcs @ {:#x}",
-            self.vcpu_id(),
+            "VmxVcpu unbind from current processor vmcs @ {:#x}",
             self.vmcs.phys_addr()
         );
 
@@ -359,7 +351,7 @@ impl<H: AxVMHal> VmxVcpu<H> {
 }
 
 // Implementation of private methods
-impl<H: AxVMHal> VmxVcpu<H> {
+impl VmxVcpu {
     #[allow(dead_code)]
     fn setup_io_bitmap(&mut self) -> AxResult {
         // By default, I/O bitmap is set as `intercept_all`.
@@ -519,7 +511,7 @@ impl<H: AxVMHal> VmxVcpu<H> {
         VmcsGuest32::INTERRUPTIBILITY_STATE.write(0)?;
         VmcsGuest32::ACTIVITY_STATE.write(0)?;
 
-        VmcsGuest32::VMX_PREEMPTION_TIMER_VALUE.write(unsafe { VMX_PREEMPTION_TIMER_SET_VALUE })?;
+        VmcsGuest32::VMX_PREEMPTION_TIMER_VALUE.write(VMX_PREEMPTION_TIMER_SET_VALUE)?;
 
         VmcsGuest64::LINK_PTR.write(u64::MAX)?; // SDM Vol. 3C, Section 24.4.2
         VmcsGuest64::IA32_DEBUGCTL.write(0)?;
@@ -665,7 +657,7 @@ impl<H: AxVMHal> VmxVcpu<H> {
 
 // Implementaton for type1.5 hypervisor
 // #[cfg(feature = "type1_5")]
-impl<H: AxVMHal> VmxVcpu<H> {
+impl VmxVcpu {
     fn set_cr(&mut self, cr_idx: usize, val: u64) {
         (|| -> AxResult {
             // debug!("set guest CR{} to val {:#x}", cr_idx, val);
@@ -739,7 +731,7 @@ macro_rules! vmx_entry_with {
     }
 }
 
-impl<H: AxVMHal> VmxVcpu<H> {
+impl VmxVcpu {
     #[naked]
     /// Enter guest with vmlaunch.
     ///
@@ -831,7 +823,7 @@ impl<H: AxVMHal> VmxVcpu<H> {
         Specifically, the timer counts down by 1 every time bit X in the TSC changes due to a TSC increment.
         The value of X is in the range 0–31 and can be determined by consulting the VMX capability MSR IA32_VMX_MISC (see Appendix A.6).
          */
-        VmcsGuest32::VMX_PREEMPTION_TIMER_VALUE.write(unsafe { VMX_PREEMPTION_TIMER_SET_VALUE })?;
+        VmcsGuest32::VMX_PREEMPTION_TIMER_VALUE.write(VMX_PREEMPTION_TIMER_SET_VALUE)?;
         Ok(())
     }
 
@@ -1026,7 +1018,7 @@ impl<H: AxVMHal> VmxVcpu<H> {
     }
 }
 
-impl<H: AxVMHal> Drop for VmxVcpu<H> {
+impl Drop for VmxVcpu {
     fn drop(&mut self) {
         unsafe { vmx::vmclear(self.vmcs.phys_addr().as_usize() as u64).unwrap() };
         info!("[HV] dropped VmxVcpu(vmcs: {:#x})", self.vmcs.phys_addr());
@@ -1049,7 +1041,7 @@ fn get_tr_base(tr: SegmentSelector, gdt: &DescriptorTablePointer<u64>) -> u64 {
     }
 }
 
-impl<H: AxVMHal> Debug for VmxVcpu<H> {
+impl Debug for VmxVcpu {
     fn fmt(&self, f: &mut Formatter) -> Result {
         (|| -> AxResult<Result> {
             Ok(f.debug_struct("VmxVcpu")
@@ -1070,7 +1062,7 @@ impl<H: AxVMHal> Debug for VmxVcpu<H> {
     }
 }
 
-impl<H: AxVMHal> AxArchVCpu for VmxVcpu<H> {
+impl AxArchVCpu for VmxVcpu {
     type CreateConfig = ();
 
     type SetupConfig = ();
