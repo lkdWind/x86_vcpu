@@ -802,7 +802,6 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
 /// Get ready then vmlaunch or vmresume.
 macro_rules! vmx_entry_with {
     ($instr:literal) => {
-        unsafe {
             naked_asm!(
                 save_regs_to_stack!(),                  // save host status
                 "mov    [rdi + {host_stack_size}], rsp", // save current RSP to Vcpu::host_stack_top
@@ -814,7 +813,6 @@ macro_rules! vmx_entry_with {
                 failed = sym Self::vmx_entry_failed,
                 // options(noreturn),
             )
-        }
     }
 }
 
